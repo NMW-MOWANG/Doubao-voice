@@ -1,0 +1,12 @@
+# 个人配置：含 API Key，不要提交
+config.json
+
+# Python 产物
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+
+# 日志
+*.log
