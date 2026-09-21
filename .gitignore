@@ -11,6 +11,8 @@ dist/
 # 日志
 *.log
 
-# 前端原型（prototype/）：依赖、锁文件和构建产物都不提交，dist/ 已被上面覆盖
+# 前端原型（prototype/）：依赖、生效中的 npm 配置和锁文件都不提交，dist/ 已被上面覆盖
+# 双环境：.npmrc.public/.baidu 与 package-lock.public/.baidu.json 入库，用 switch-registry.sh 切换
 node_modules/
+.npmrc
 package-lock.json
