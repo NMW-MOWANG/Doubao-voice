@@ -78,6 +78,22 @@ else
     echo "   ✓ 已有 wl-clipboard"
 fi
 
+# 浮标（overlayd.py）除了 GTK3，还要 GI 能把 cairo 类型交给 draw 回调。光有 python3-gi
+# 不够 —— python3-gi-cairo 不随它一起装，缺了它浮标的清屏（透明）和点击穿透会静默失效：
+# 点击穿透那段是 except Exception: pass，清了屏的回调则根本不会被调用，只在 stderr 留一句
+# "Couldn't find foreign struct converter for 'cairo.Context'"。
+if python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk; gi.require_foreign('cairo')" 2>/dev/null; then
+    echo "   ✓ 已有 GTK3 + cairo 绑定"
+else
+    echo "== 补装浮标要用的 GTK3 + cairo 绑定 =="
+    if command -v apt-get >/dev/null; then
+        apt-get install -y python3-gi python3-gi-cairo gir1.2-gtk-3.0 ||
+            echo "   ! 安装失败，请手动执行：sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0" >&2
+    else
+        echo "   ! 请手动安装 python3-gi / python3-gi-cairo / gir1.2-gtk-3.0" >&2
+    fi
+fi
+
 echo
 if [[ $ok -eq 1 ]]; then
     echo "搞定，现在可以用 ${TARGET_USER} 的身份跑 python3 voice_input.py 了。"

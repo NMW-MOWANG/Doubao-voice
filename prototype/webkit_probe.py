@@ -43,9 +43,15 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, GLib, Gtk, WebKit2  # noqa: E402
 
 # pycairo：GTK 的 draw 回调给的就是 cairo.Context，但模块本身要自己 import
-# （Ubuntu 上是 python3-gi-cairo，一般随 python3-gi 一起装）。缺了就退化成"不清屏"。
+# （Ubuntu 上是 python3-cairo；GI 那侧的转换归 python3-gi-cairo 管）。缺了就退化成"不清屏"。
 try:
     import cairo  # noqa: E402
+
+    # 光 import 成功不够：GI 还得能把 cairo 类型交给回调，那是 python3-gi-cairo
+    # 里的 gi._gi_cairo 提供的，而它并不随 python3-gi 一起装。缺了它 import 照样
+    # 过，但回调根本不会被调用，只在 stderr 打一句 "Couldn't find foreign struct
+    # converter for 'cairo.Context'" —— 于是既不清屏也不穿透。
+    gi.require_foreign("cairo")
 except ImportError:  # pragma: no cover
     cairo = None  # type: ignore[assignment]
 
@@ -291,12 +297,18 @@ class Probe:
             print("WebGL2  : 没收到回报（页面没加载完，或标题没更新）")
         elif self.webgl.get("webgl2"):
             renderer = str(self.webgl.get("renderer", "?"))
-            software = any(k in renderer.lower() for k in ("llvmpipe", "softpipe", "swiftshader", "software"))
-            print(f"WebGL2  : ✓ 有")
+            print("WebGL2  : ✓ 有")
             print(f"  renderer = {renderer}")
             print(f"  vendor   = {self.webgl.get('vendor', '?')}")
             print(f"  version  = {self.webgl.get('version', '?')}")
-            print(f"  → {'⚠ 软件渲染！常驻浮标上 CPU 会很难看' if software else '✓ 看起来是硬件加速'}")
+            # WebKitGTK 把真实 renderer 抹掉了：RENDERER 恒为 "WebKit WebGL"，
+            # WEBGL_debug_renderer_info 给的是 "Apple GPU"/"Apple Inc." 这类固定值（防指纹）。
+            # 所以 "含 llvmpipe 就是软件渲染" 这套判据在这里永远不会命中 —— 判不了，看 CPU。
+            if renderer in ("Apple GPU", "WebKit WebGL"):
+                print("  → 这串是 WebKit 的固定占位值，判不出硬件还是软件渲染；以 CPU 占用为准")
+            else:
+                software = any(k in renderer.lower() for k in ("llvmpipe", "softpipe", "swiftshader", "software"))
+                print(f"  → {'⚠ 软件渲染！常驻浮标上 CPU 会很难看' if software else '✓ 看着像硬件加速'}")
         else:
             print(f"WebGL2  : ✗ 没有 —— metal-fx 会静默退化成普通子元素（{self.webgl.get('error', '')}）")
         if not self.focus_before:
@@ -329,6 +341,9 @@ def main() -> int:
     print(f"WebKitGTK 探针：{'URL ' + args.url if args.url else '自带体检页'}")
     print(f"  尺寸 {args.width}x{args.height}，override-redirect={not args.no_override}，"
           f"点击穿透={not args.no_click_through}")
+    if cairo is None:
+        print("  ! 没有可用的 cairo 绑定（缺 python3-gi-cairo）——「透明」和「点击穿透」这次测不到，")
+        print("    先 sudo apt install python3-gi-cairo 再跑")
     if args.url:
         print("  （量真实开销时建议先起 bridge.py；页面里的两个效果会一直动，等于最坏情况）")
     print()
