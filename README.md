@@ -320,3 +320,5 @@ sudo bash setup_linux.sh --remove      # 撤掉 udev 规则
 ## 参考
 
 - 官方 demo 解压在 `_ref/sauc_python/`，接口说明见 `api接入说明.md`。
+- 浮标里的 React 特效是怎么嵌进来的（选型、踩过的坑、验证手法、开销账）：
+  `docs/把React组件嵌进桌面应用.md`。
