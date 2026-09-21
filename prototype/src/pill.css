@@ -1,0 +1,44 @@
+/* 浮标本体：预览页（App.tsx）和嵌入页（embed.tsx）共用，所以这里只放胶囊自己的样式，
+   不要碰 html/body/面板——预览页的背景由 styles.css 管，嵌入页则由 embed.html 管。 */
+
+.pill,
+.ring {
+  /* 预览页有全局 border-box，嵌入页没有，所以自己声明一份，免得两边尺寸不一致 */
+  box-sizing: border-box;
+}
+
+.pill {
+  width: 340px;
+  height: 60px;
+  border-radius: 30px;
+  background: rgba(31, 33, 38, 0.92);
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 0 18px 0 14px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+}
+
+.ring {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+}
+
+/* MetalFx 的包裹层是 inline-flex，别让它在 flex 行里被压扁 */
+.ring-metal {
+  flex: none;
+}
+
+.pill-text {
+  min-width: 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.95);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

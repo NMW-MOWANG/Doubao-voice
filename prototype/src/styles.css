@@ -87,44 +87,6 @@ code {
   letter-spacing: 0.4px;
 }
 
-/* ---------- 浮标本体（对齐 overlayd.py 的样子）---------- */
-
-.pill {
-  width: 340px;
-  height: 60px;
-  border-radius: 30px;
-  background: rgba(31, 33, 38, 0.92);
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding: 0 18px 0 14px;
-  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
-}
-
-.ring {
-  flex: none;
-  width: 44px;
-  height: 44px;
-  border: 2px solid currentColor;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-}
-
-/* MetalFx 的包裹层是 inline-flex，别让它在 flex 行里被压扁 */
-.ring-metal {
-  flex: none;
-}
-
-.pill-text {
-  min-width: 0;
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.95);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* ---------- 调节面板 ---------- */
 
 .panel {

@@ -13,6 +13,7 @@
   "vad_threshold": 200,
   "max_seconds": 300,
   "show_overlay": true,
+  "overlay_renderer": "auto",
   "show_window": false,
   "always_on_top": true,
   "notify": false,

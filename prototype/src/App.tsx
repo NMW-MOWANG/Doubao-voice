@@ -5,6 +5,9 @@ import { MetalFx, isMetalFxSupported } from 'metal-fx';
 import type { MetalFxPreset } from 'metal-fx';
 import { PHASE_TEXT, useDriver } from './driver';
 import type { Phase, Source } from './driver';
+// 胶囊自己的样式和嵌入页共用；面板/背景那些留在 styles.css
+import './pill.css';
+import './styles.css';
 
 /** 跟 overlay.py 的 STATE_COLORS 对齐，方便和现在的浮标直接对比。 */
 const STATE_DOT: Record<Phase, string> = {

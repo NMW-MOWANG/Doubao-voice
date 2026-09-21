@@ -61,6 +61,9 @@ DEFAULTS = {
     "vad_threshold": 200,
     "max_seconds": 300,
     "show_overlay": True,
+    # 浮标渲染器：auto | webkit | cairo。webkit 走 prototype 的页面（有特效，约 450MB 内存），
+    # cairo 是老画法（没有特效，几乎不占内存），auto = 构建产物在就用 webkit
+    "overlay_renderer": "auto",
     "show_window": False,
     "always_on_top": True,
     "notify": False,

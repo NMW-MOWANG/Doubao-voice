@@ -128,6 +128,12 @@ python3 voice_input.py --detect-key --as hold --restart     # 按一下按键就
 > 首次启动会自动测一次环境噪声并把灵敏度阈值调到合适值（本机环境噪声偏大，默认的 200 会让"静音自动停止"
 > 永远不触发），测完会提示一句；之后可以在设置里手动改或重新检测。
 
+还有一项**只在 `config.json` 里**（设置面板没做）：`overlay_renderer` = `auto`（默认）/ `webkit` / `cairo`。
+`webkit` 把 `prototype/` 里的页面嵌进浮标，于是有 voice-glow 的光束和 metal-fx 的金属环；`cairo` 是原来的画法
+（胶囊 + 圆环 + 文字，没有特效）。实测开销差得多：webkit 显示时约 **1 个核**、常驻内存约 **550MB**；
+cairo 基本不占。`auto` 在 `prototype/dist/embed.html` 存在且 WebKit 可用时选 webkit，否则退回 cairo。
+临时切换可以用环境变量：`DOUBAO_OVERLAY_RENDERER=cairo python3 voice_input.py`。
+
 ## 命令行
 
 ```bash
@@ -246,6 +252,16 @@ doubao_voice/
   一抢焦点正在打字的窗口就收不到字了；而 X11 的 override-redirect 窗口不受窗口管理器管辖，抢不到焦点
   （`Gdk.Window.set_override_redirect`，实测确认过）。主进程保持 Wayland 客户端是有原因的：本机
   XWayland 和 Wayland 之间的剪贴板**不互通**（两个方向都实测过），跑在 X11 上的话剪贴板就是废的。
+- **浮标里的特效是怎么来的**：默认渲染器（`overlay_renderer=auto`）下 overlayd 起一个 WebKit2 WebView 加载
+  `prototype/dist/embed.html`（Vite 构建产物；页面只有那颗胶囊、整页透明）。窗口外形和状态协议都没变——
+  还是那个 override-redirect、不抢焦点、点击穿透的窗口，只是「怎么画」交给网页，于是有了 voice-glow 的
+  光束和 metal-fx 的金属环。三条踩过的坑：① 浮标窗口在拿到第一帧之前是隐藏的，隐藏时页面视口是 **0×0**，
+  所以页面里胶囊的尺寸写死 340×60（0 尺寸的 canvas 在 WebKit 里拿不到 WebGL context）；② 特效组件抛错会把
+  整棵 React 树卸掉（整页空白，比没有特效更糟），所以页面里套了错误边界、临时解不开就退回"普通胶囊"，
+  挂 MetalFx 之前也先用它自己那条分支探一次 WebGL2；③ WebKitGTK 有 `OffscreenCanvas` 却不支持在上面创建
+  WebGL2，而 metal-fx 优先用它，于是抛 `WebGL2 not supported` 把整页带下去（作者的预览页在 WebKit 里同样
+  白屏）——嵌入页在加载前把这个全局藏掉，metal-fx 便退回普通 canvas。另外隐藏浮标时页面会把整棵特效树
+  卸掉，免得 voice-glow 的 rAF 常驻空转（实测隐藏时的占用从 6.4% 降到 3.2% 单核）。
 - **剪贴板为什么用 wl-clipboard**：本机实测 GTK3/GTK4 的剪贴板 API 对没有窗口的后台程序不生效——
   `wl-paste` 读不到 GTK 设进去的内容，反过来 `wl-copy` 设的 GTK 也读不到。
 - **终端 vs 别的窗口怎么区分粘贴键**：终端的粘贴是 `Ctrl+Shift+V`，别的程序是 `Ctrl+V`，发错了字就进不去。

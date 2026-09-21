@@ -94,6 +94,20 @@ else
     fi
 fi
 
+# 浮标默认渲染器（overlay_renderer=auto）在有 prototype/dist/embed.html 时会选 WebKit，需要这个 typelib。
+# 装不上也不影响使用：auto 会退回 cairo 画法，只是没有特效。
+if python3 -c "import gi; gi.require_version('WebKit2','4.1')" 2>/dev/null; then
+    echo "   ✓ 已有 WebKit2（浮标特效渲染器可用）"
+else
+    echo "== 补装 WebKit2（浮标特效要用）=="
+    if command -v apt-get >/dev/null; then
+        apt-get install -y gir1.2-webkit2-4.1 ||
+            echo "   ! 安装失败，浮标会退回 cairo 画法（没特效），要用特效请手动装 gir1.2-webkit2-4.1" >&2
+    else
+        echo "   ! 请手动安装 gir1.2-webkit2-4.1" >&2
+    fi
+fi
+
 echo
 if [[ $ok -eq 1 ]]; then
     echo "搞定，现在可以用 ${TARGET_USER} 的身份跑 python3 voice_input.py 了。"
