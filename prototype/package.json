@@ -1,0 +1,25 @@
+{
+  "name": "doubao-voice-glow-prototype",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "voice-glow 效果原型：在真实浮标尺寸（340x60）下预览录音/识别动画",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "metal-fx": "^2.0.10",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "voice-glow": "^0.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

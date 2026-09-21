@@ -10,3 +10,6 @@ dist/
 
 # 日志
 *.log
+
+# 前端原型（prototype/）：依赖和构建产物都不提交，dist/ 已被上面覆盖
+node_modules/
