@@ -36,15 +36,22 @@ OUTPUT_MODES = {
     "仅复制到剪贴板": "clipboard",
 }
 
+# 粘贴快捷键：终端的粘贴是 Ctrl+Shift+V，别的程序是 Ctrl+V
+PASTE_SHORTCUTS = {
+    "自动识别（终端用 Ctrl+Shift+V）": "auto",
+    "总是 Ctrl+V": "ctrl+v",
+    "总是 Ctrl+Shift+V": "ctrl+shift+v",
+}
+
 DEFAULTS = {
     # ---- 接口 ----
     "api_key": "",
     "resource_id": "volc.bigasr.sauc.duration",
     "endpoint": "stream",
     "language": "zh-CN",
-    # ---- 触发按键 ----
-    "hold_key": "0:163:29",
-    "toggle_key": "3:68:32",
+    # ---- 触发按键（Linux 用 evdev 码：修饰键位:内核键码）----
+    "hold_key": "0:97",      # KEY_RIGHTCTRL
+    "toggle_key": "3:32",    # Ctrl+Alt+D
     "share_keys": True,
     # ---- 录音 ----
     "live_typing": True,
@@ -56,6 +63,12 @@ DEFAULTS = {
     "show_overlay": True,
     "show_window": False,
     "always_on_top": True,
+    "notify": False,
+    "restore_clipboard": True,
+    "paste_shift": False,
+    "paste_shortcut": "auto",
+    "release_modifiers": True,
+    "live_interval_ms": 350,
     "device": -1,
     # ---- 识别结果处理（官方 request 参数）----
     "enable_punc": True,

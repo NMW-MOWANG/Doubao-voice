@@ -1,22 +1,23 @@
-"""录音时浮在桌面上的小图标。
+"""录音浮标（主进程这一侧）。
 
-要求：绝不抢焦点（否则正在打字的窗口会丢焦点，文字就进错地方了），
-所以除了置顶 + 无边框，还要给窗口加上 WS_EX_NOACTIVATE 和 WS_EX_TRANSPARENT。
+浮标本身不在这个进程里画，而是交给一个 X11 子进程（overlayd.py）。原因：
+* Wayland 下任何新窗口都会抢焦点，焦点一跑，正在打字的窗口就收不到字了；
+* X11 的 override-redirect 窗口不受窗口管理器管辖，想抢也抢不到，实测确认过。
+
+所以主进程保持 Wayland（剪贴板、窗口都在 Wayland 这边才正常），浮标丢给
+GDK_BACKEND=x11 的子进程，两边用标准输入上的 JSON 行通信。
 """
 
 from __future__ import annotations
 
-import ctypes
-import tkinter as tk
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-GWL_EXSTYLE = -20
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
-
-TRANSPARENT_COLOR = "#ff00ff"
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 STATE_COLORS = {
     "recording": "#e8453c",
@@ -25,115 +26,120 @@ STATE_COLORS = {
     "error": "#d93025",
 }
 
-WIDTH, HEIGHT = 320, 56
-MARGIN_BOTTOM = 120
-
-
-def _set_extended_style(hwnd: int, extra: int) -> None:
-    getter = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-    setter = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-    getter.restype = ctypes.c_ssize_t
-    setter.restype = ctypes.c_ssize_t
-    style = getter(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
-    setter(ctypes.c_void_p(hwnd), GWL_EXSTYLE, style | extra)
-
 
 class Overlay:
     """底部居中的小浮标：麦克风图标 + 音量环 + 一行提示文字。"""
 
-    def __init__(self, master: tk.Misc):
-        self.window = tk.Toplevel(master)
-        self.window.overrideredirect(True)
-        self.window.attributes("-topmost", True)
-        try:
-            self.window.attributes("-transparentcolor", TRANSPARENT_COLOR)
-        except tk.TclError:
-            pass
-
-        self.canvas = tk.Canvas(
-            self.window,
-            width=WIDTH,
-            height=HEIGHT,
-            bg=TRANSPARENT_COLOR,
-            highlightthickness=0,
-        )
-        self.canvas.pack()
-
-        self._ring = self.canvas.create_oval(4, 4, 52, 52, outline=STATE_COLORS["recording"], width=2, fill="#1f2023")
-        self._level = self.canvas.create_arc(
-            4, 4, 52, 52, start=90, extent=0, style="arc",
-            outline=STATE_COLORS["recording"], width=3,
-        )
-        self.canvas.create_oval(20, 13, 36, 33, fill="#ffffff", outline="")
-        self.canvas.create_arc(15, 20, 41, 44, start=200, extent=140, style="arc", outline="#ffffff", width=2)
-        self.canvas.create_line(28, 42, 28, 47, fill="#ffffff", width=2)
-        self.canvas.create_line(21, 47, 35, 47, fill="#ffffff", width=2)
-        self._text = self.canvas.create_text(
-            64, HEIGHT // 2, anchor="w", text="", fill="#ffffff",
-            font=("Microsoft YaHei UI", 11),
-        )
-
-        self.window.update_idletasks()
-        self._place()
-        self.window.withdraw()
-        self._make_click_through()
-        self.state = ""
-        self._pulse = 0.0
+    def __init__(self, enabled: bool = True):
+        self.error: str | None = None
+        self._enabled = bool(enabled) and bool(os.environ.get("DISPLAY"))
+        self._process: subprocess.Popen | None = None
+        self._state = ""
+        self._text = ""
+        self._visible = False
+        self._last_level = -1.0
+        self._last_sent = 0.0
+        self._lock = threading.Lock()
+        if enabled and not os.environ.get("DISPLAY"):
+            self.error = "没有 X11 显示（DISPLAY 为空），浮标显示不了"
 
     # ---------- 对外 ----------
 
-    def show(self, state: str, text: str = "") -> None:
-        self.state = state
-        color = STATE_COLORS.get(state, STATE_COLORS["recording"])
-        self.canvas.itemconfigure(self._ring, outline=color)
-        self.canvas.itemconfigure(self._level, outline=color)
-        self.canvas.itemconfigure(self._text, text=text)
-        if not self.window.winfo_viewable():
-            self._place()
-            self.window.deiconify()
-            self.window.lift()
-
-    def set_level(self, level: float) -> None:
-        if self.state != "recording":
-            return
-        extent = -max(0.0, min(1.0, level)) * 360.0
-        self.canvas.itemconfigure(self._level, extent=extent)
-
-    def tick(self) -> None:
-        """识别中时让圆环脉动，给用户"它在干活"的感觉。"""
-        if self.state != "recognizing" or not self.window.winfo_viewable():
-            return
-        self._pulse = (self._pulse + 0.12) % 1.0
-        extent = -(0.15 + 0.45 * abs(1 - 2 * self._pulse)) * 360.0
-        self.canvas.itemconfigure(self._level, extent=extent)
-
-    def set_text(self, text: str) -> None:
-        self.canvas.itemconfigure(self._text, text=text)
-
-    def hide(self) -> None:
-        self.state = ""
-        self.window.withdraw()
+    @property
+    def available(self) -> bool:
+        return self._enabled
 
     @property
     def visible(self) -> bool:
-        return bool(self.window.winfo_viewable())
+        return self._visible
 
-    # ---------- 内部 ----------
+    def show(self, state: str, text: str = "") -> None:
+        # 状态和文字都没变就不要再通知子进程了：它收到一条就重绘一次整个半透明窗口
+        if self._visible and state == self._state and text == self._text:
+            return
+        self._state = state
+        self._text = text
+        self._visible = True
+        self._send({"cmd": "show", "state": state, "text": text})
 
-    def _place(self) -> None:
-        screen_w = self.window.winfo_screenwidth()
-        screen_h = self.window.winfo_screenheight()
-        x = max(0, (screen_w - WIDTH) // 2)
-        y = max(0, screen_h - HEIGHT - MARGIN_BOTTOM)
-        self.window.geometry(f"{WIDTH}x{HEIGHT}+{x}+{y}")
+    def set_level(self, level: float) -> None:
+        if not self._visible:
+            return
+        level = max(0.0, min(1.0, float(level)))
+        now = time.monotonic()
+        # 音量表 12 帧/秒足够顺眼，再快只是让子进程白白重绘
+        if now - self._last_sent < 0.08 or abs(level - self._last_level) < 0.03:
+            return
+        self._last_level = level
+        self._send({"cmd": "level", "value": round(level, 3)})
 
-    def _make_click_through(self) -> None:
+    def set_text(self, text: str) -> None:
+        if text == self._text:
+            return
+        self._text = text
+        if self._visible:
+            self._send({"cmd": "text", "text": text})
+
+    def tick(self) -> None:
+        """识别中的脉动由浮标进程自己动，这边不用管（保留接口）。"""
+
+    def hide(self) -> None:
+        self._visible = False
+        self._send({"cmd": "hide"})
+
+    def close(self) -> None:
+        with self._lock:
+            process, self._process = self._process, None
+        if process is None:
+            return
         try:
-            hwnd = self.window.winfo_id()
-            for handle in (hwnd, user32.GetParent(ctypes.c_void_p(hwnd)) or 0):
-                if handle:
-                    _set_extended_style(
-                        handle, WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
-                    )
-        except Exception:
+            if process.stdin:
+                process.stdin.close()
+        except OSError:
             pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    # ---------- 子进程 ----------
+
+    def _send(self, payload: dict) -> None:
+        if not self._enabled:
+            return
+        process = self._ensure_process()
+        if process is None or process.stdin is None:
+            return
+        self._last_sent = time.monotonic()
+        try:
+            process.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            process.stdin.flush()
+        except (OSError, ValueError):
+            self._enabled = False
+            self.error = "浮标进程退出了，浮标已关闭"
+
+    def _ensure_process(self) -> subprocess.Popen | None:
+        with self._lock:
+            if self._process is not None and self._process.poll() is None:
+                return self._process
+            if self._process is not None:
+                self._enabled = False
+                self.error = "浮标进程起不来，浮标已关闭"
+                return None
+            env = dict(os.environ)
+            env["GDK_BACKEND"] = "x11"
+            env["PYTHONPATH"] = APP_DIR + os.pathsep + env.get("PYTHONPATH", "")
+            try:
+                self._process = subprocess.Popen(
+                    [sys.executable, "-m", "doubao_voice.overlayd"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                    cwd=APP_DIR,
+                )
+            except OSError as exc:
+                self._enabled = False
+                self.error = f"浮标进程启动失败：{exc}"
+                return None
+            return self._process

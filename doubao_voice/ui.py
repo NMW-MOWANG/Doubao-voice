@@ -1,26 +1,33 @@
-"""界面层。
+"""界面层（GTK3）。
 
-程序形态是一个常驻后台的小工具：
-* 平时没有任何窗口，只有托盘图标；
-* 按下录音键时桌面底部出现一个麦克风浮标，提示"在听"；
-* 主界面和设置面板按需从托盘打开，关掉不影响运行。
+形态和原来的 Windows 版一致：
+* 平时没有任何窗口，控制入口在顶栏的托盘图标上（GNOME 用 StatusNotifierItem）；
+* 按下录音键时桌面底部出现一个麦克风浮标；
+* 主界面和设置面板按需打开，关掉不影响后台运行。
+
+本机没装 tkinter（也装不了），项目里已装的 GUI 库是 PyGObject，所以界面用 GTK3，
+跑在 Wayland 后端（剪贴板、焦点都由 Wayland 管）；浮标例外，见 overlay.py。
 """
 
 from __future__ import annotations
 
-import ctypes
 import queue
 import threading
 import time
-import tkinter as tk
-from tkinter import ttk, messagebox
 
-from . import config, engine, instance, keyhook, tray, winutil
-from .overlay import Overlay
-from .recorder import list_input_devices, measure_noise
-from .settings import SettingsDialog
+import gi
 
-FONT = "Microsoft YaHei UI"
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+from . import config, engine, instance, keyhook, linuxutil, tray  # noqa: E402
+from .overlay import Overlay  # noqa: E402
+from .recorder import measure_noise  # noqa: E402
+from .settings import SettingsDialog  # noqa: E402
+
+POLL_MS = 50          # 录音/识别中、或者窗口可见时的轮询间隔
+IDLE_POLL_MS = 250    # 待机且没有窗口时的间隔（省电）
 
 DOT_COLORS = {
     "idle": "#9aa0a6",
@@ -29,7 +36,7 @@ DOT_COLORS = {
     "error": "#d93025",
 }
 
-FLASH_SECONDS = {"done": 1.6, "error": 5.0, "notice": 3.0}
+FLASH_SECONDS = {"done": 2.0, "error": 6.0, "notice": 4.0}
 
 STATE_TITLES = {
     "recording": "正在录音",
@@ -41,16 +48,6 @@ STATE_TITLES = {
 }
 
 
-def enable_dpi_awareness() -> None:
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except (AttributeError, OSError):
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except (AttributeError, OSError):
-            pass
-
-
 class App:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -58,12 +55,16 @@ class App:
         if not self.guard.acquire():
             raise RuntimeError(
                 "已经有一个「豆包语音输入」在运行，而且它没能退出。"
-                "请在任务管理器里结束 pythonw.exe 后重试。"
+                "可以先执行 python3 voice_input.py --quit 再启动。"
             )
         self.events: queue.Queue = queue.Queue()
         self.guard.watch(self.events)
-        self.session = engine.Session(cfg, self.events)
-        self.target_window: int | None = None
+        self.guard.status_provider = self._status_text
+
+        self.injector = linuxutil.KeyInjector()
+        self.injector_error: str | None = None
+        self.session = engine.Session(cfg, self.events, self.injector)
+
         self.result_text = ""
         self.message = "已启动，按录音键说话"
         self.state = "idle"
@@ -72,60 +73,95 @@ class App:
         self._flash_until = 0.0
         self._capturing: str | None = None
         self._settings: SettingsDialog | None = None
-        self._started_at = time.monotonic()
 
-        self.root = tk.Tk()
-        self.root.withdraw()
-        self.root.title("豆包语音输入")
-        self.root.report_callback_exception = self._on_tk_error
-
-        self.overlay = Overlay(self.root)
-
+        self.overlay = Overlay(enabled=bool(cfg.get("show_overlay", True)))
         self.tray = tray.TrayIcon(self.events)
-        self.tray.start()
-        self.tray.wait_ready()
-
         self.hook = keyhook.KeyboardHook(
-            self.events, share_keys=bool(self.cfg.get("share_keys", True))
+            self.events, share_keys=bool(cfg.get("share_keys", True))
         )
+        self._first_run = not config.CONFIG_PATH.exists()
+
+        self.window = MainWindow(self)
+        self._start()
+
+    # ------------------------------------------------------------ 启动
+
+    def _start(self) -> None:
+        # 发粘贴前先问钩子"用户还按着哪些修饰键"，把残留的修饰键抬起来
+        self.injector.set_modifier_source(self.hook.held_modifier_codes)
+        self.injector.set_release_stuck(bool(self.cfg.get("release_modifiers", True)))
+        try:
+            self.injector.open()
+        except RuntimeError as exc:
+            self.injector_error = str(exc)
+
+        self.tray.start()
+        self.tray.wait_ready(2.0)
+
         self.hook.set_bindings(self._bindings())
         self.hook.start()
-        self.hook.wait_ready()
+        self.hook.wait_ready(1.5)
 
-        self.window = MainWindow(self.root, self)
         if self.cfg.get("show_window"):
             self.window.show()
 
-        problem = self.hook.error or self.tray.error
-        if problem:
-            self._notify("error", problem)
-        if self.tray.error:
-            # 托盘没了就没有任何入口，把主界面亮出来兜底
-            self.window.show()
-        if not (self.cfg.get("api_key") or "").strip():
-            self._notify("notice", "还没填 API Key，从托盘图标进去设置")
-            self.root.after(600, self.open_settings)
+        for problem in (self.injector_error, self.hook.error, self.tray.error):
+            if problem:
+                self._notify("error", problem)
 
-        self.root.after(50, self._poll)
+        if self.tray.error:
+            self.window.show()  # 托盘没起来就没有入口了，把主界面亮出来兜底
+
+        if not (self.cfg.get("api_key") or "").strip():
+            self._notify("notice", "还没填 API Key，先打开设置填一下")
+            GLib.timeout_add(600, self.open_settings)
+
+        if self._first_run:
+            self._auto_calibrate()  # 头一次跑，先摸一下这台机器的环境噪声
+
+        GLib.timeout_add(IDLE_POLL_MS, self._poll)
+
+    def _auto_calibrate(self) -> None:
+        """首次启动自动测一次环境噪声。
+
+        默认阈值（200）是按 Windows 那台机器的安静环境定的，本机环境噪声 RMS 就有
+        六千多，用默认值"静音自动停止"永远不会触发，所以第一次跑就把阈值调到位。
+        """
+
+        def worker() -> None:
+            try:
+                noise = measure_noise(device=self.cfg.get("device", -1), seconds=2.0)
+            except Exception:
+                return
+            if noise <= 0:
+                return
+            threshold = max(80, int(noise * 2.5))
+            self.cfg["vad_threshold"] = threshold
+            try:
+                config.save(self.cfg)
+            except Exception:
+                pass
+            self.events.put(
+                ("notice", f"已按环境噪声（{noise:.0f}）把灵敏度设为 {threshold}，设置里可改")
+            )
+            if self._settings is not None and self._settings.winfo_exists():
+                self._settings.apply_calibration(noise)
+
+        threading.Thread(target=worker, daemon=True, name="calibrate").start()
 
     # ------------------------------------------------------------ 事件循环
 
-    def _poll(self) -> None:
-        try:
-            hwnd = winutil.foreground_window()
-            if hwnd and not winutil.own_foreground_window():
-                self.target_window = hwnd
-        except Exception:
-            pass
-
+    def _poll(self) -> bool:
         try:
             while True:
                 self._handle(self.events.get_nowait())
         except queue.Empty:
             pass
-
+        busy = self.session.busy or self.state != "idle"
         self._refresh()
-        self.root.after(50, self._poll)
+        interval = POLL_MS if (busy or self.window.get_visible()) else IDLE_POLL_MS
+        GLib.timeout_add(interval, self._poll)
+        return False
 
     def _handle(self, event: tuple) -> None:
         kind = event[0]
@@ -189,12 +225,27 @@ class App:
             self.state = state
             self.tray.set_state(state)
 
-        self.window.refresh(phase, self.session, self.message)
+        # 窗口没露出来就别折腾 GTK 了（隐藏时刷新等于白烧 CPU）
+        if self.window.get_visible():
+            self.window.refresh(phase, self.session, self.message)
 
     def _notify(self, state: str, text: str) -> None:
         self._flash_state = state
         self._flash_text = text
         self._flash_until = time.monotonic() + FLASH_SECONDS.get(state, 2.0)
+        if state == "error" or (self.cfg.get("notify") and state in ("done", "notice")):
+            title = STATE_TITLES.get(state, "") or "豆包语音输入"
+            # 系统通知是同步 D-Bus 调用（超时 2 秒），别放在界面线程里等
+            threading.Thread(
+                target=lambda: linuxutil.notify(title, text), daemon=True
+            ).start()
+
+    def _status_text(self) -> str:
+        phase = self.session.phase()
+        return {
+            "recording": "正在录音",
+            "recognizing": "识别中",
+        }.get(phase, "待机")
 
     # ------------------------------------------------------------ 按键
 
@@ -220,7 +271,7 @@ class App:
             self._notify("error", "还没填 API Key")
             self.open_settings()
             return
-        self.session.start(self.target_window, hold=hold)
+        self.session.start(hold=hold)
 
     def toggle(self) -> None:
         if self.session.phase() == "recording":
@@ -236,31 +287,44 @@ class App:
         self._capturing = slot
         self.hook.begin_capture()
 
-    def _on_key_captured(self, mods: int, vk: int, scan: int) -> None:
+    def _on_key_captured(self, mods: int, code: int) -> None:
         slot, self._capturing = self._capturing, None
         if not slot:
             return
-        spec = keyhook.format_spec(mods, vk, scan)
+        spec = keyhook.format_spec(mods, code)
         if self._settings is not None and self._settings.winfo_exists():
             self._settings.apply_key_capture(slot, spec)
 
-    # ------------------------------------------------------------ 托盘
+    # ------------------------------------------------------------ 托盘 / 窗口
 
     def _on_tray(self, action: str) -> None:
         if action == "settings":
             self.open_settings()
         elif action == "show":
             self.window.toggle()
+        elif action == "toggle":
+            self.toggle()          # 命令行 --toggle / 托盘菜单都走这里
         elif action == "quit":
             self.quit()
+        elif action.startswith("mode:"):
+            self.toggle_mode(action.split(":", 1)[1])
 
-    # ------------------------------------------------------------ 其他
+    def toggle_mode(self, mode: str) -> None:
+        """托盘菜单里切换"长按说话 / 按一下开始"，等价于把两个键对调。"""
+        hold, toggle = self.cfg.get("hold_key", ""), self.cfg.get("toggle_key", "")
+        self.cfg["hold_key"], self.cfg["toggle_key"] = toggle, hold
+        config.save(self.cfg)
+        self.hook.set_bindings(self._bindings())
+        self.window.apply_config()
+        self.tray.set_mode(mode)
+        self.message = f"已切换为：{'长按说话' if mode == 'hold' else '按一下开始 / 再按结束'}"
+        self._notify("notice", self.message)
 
     def copy_result(self) -> None:
         if not self.result_text:
             return
         try:
-            winutil.set_clipboard_text(self.result_text)
+            linuxutil.set_clipboard_text(self.result_text)
             self.message = "已复制到剪贴板"
         except Exception as exc:
             self.message = f"复制失败：{exc}"
@@ -270,7 +334,7 @@ class App:
 
         def worker() -> None:
             try:
-                value = measure_noise(device=int(self.cfg.get("device", -1)))
+                value = measure_noise(device=self.cfg.get("device", -1))
                 self.events.put(("calibrated", value))
             except Exception as exc:
                 self.events.put(("calibrate_failed", f"环境噪声检测失败：{exc}"))
@@ -283,8 +347,7 @@ class App:
 
     def open_settings(self) -> None:
         if self._settings is not None and self._settings.winfo_exists():
-            self._settings.lift()
-            self._settings.focus_set()
+            self._settings.present()
             return
         self._settings = SettingsDialog(self)
 
@@ -294,24 +357,17 @@ class App:
         config.save(self.cfg)
         self.hook.set_bindings(self._bindings())
         self.hook.set_share_keys(bool(self.cfg.get("share_keys", True)))
+        self.injector.set_release_stuck(bool(self.cfg.get("release_modifiers", True)))
+        self.overlay = Overlay(enabled=bool(self.cfg.get("show_overlay", True)))
         self.window.apply_config()
         self.message = "设置已保存"
         self._notify("notice", "设置已保存")
 
-    def _on_tk_error(self, exc_type, exc_value, exc_tb) -> None:
-        self.message = f"界面异常：{exc_value}"
+    # ------------------------------------------------------------ 退出
 
     def quit(self) -> None:
         try:
             self.session.cancel()
-        except Exception:
-            pass
-        try:
-            # 只落盘窗口位置：整体写回会把"运行期间被外部改过的配置"覆盖掉
-            position = self.cfg.get("window_pos", "")
-            if self.window.winfo_viewable():
-                position = self.window.position()
-            config.save_window_pos(position)
         except Exception:
             pass
         for stopper in (self.hook.stop, self.tray.stop):
@@ -319,145 +375,163 @@ class App:
                 stopper()
             except Exception:
                 pass
-        # 留点时间让托盘线程把图标摘掉，否则通知区会留个幽灵图标
-        self.root.after(400, self._shutdown)
-
-    def _shutdown(self) -> None:
+        try:
+            self.overlay.close()
+        except Exception:
+            pass
+        try:
+            self.injector.close()
+        except Exception:
+            pass
         self.guard.release()
-        self.root.destroy()
+        GLib.timeout_add(200, Gtk.main_quit)
 
     def run(self) -> None:
-        self.root.mainloop()
+        Gtk.main()
 
 
-class MainWindow(tk.Toplevel):
+class MainWindow(Gtk.Window):
     """按需打开的主界面：看结果、手动开始、改设置。"""
 
-    def __init__(self, master: tk.Misc, app: App):
-        super().__init__(master)
+    def __init__(self, app: App):
+        super().__init__(title="豆包语音输入")
         self.app = app
-        self.title("豆包语音输入")
-        self.resizable(False, False)
-        self.protocol("WM_DELETE_WINDOW", self.hide)
-        self.report_callback_exception = app._on_tk_error
+        self.set_default_size(440, 300)
+        self.set_resizable(False)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("delete-event", self._on_delete)
         self._build()
-        self.withdraw()
+        self.hide()
+
+    def _on_delete(self, *_args) -> bool:
+        self.hide()
+        return True  # 关掉只是隐藏，后台继续跑
 
     def _build(self) -> None:
-        pad = {"padx": 10}
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        self.add(box)
 
-        top = ttk.Frame(self)
-        top.pack(fill="x", **pad, pady=(10, 4))
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.pack_start(top, False, False, 0)
 
-        self.dot = tk.Canvas(top, width=12, height=12, highlightthickness=0)
-        self.dot.pack(side="left")
-        self._dot_item = self.dot.create_oval(1, 1, 11, 11, fill=DOT_COLORS["idle"], outline="")
+        self.dot = Gtk.Label()
+        self.dot.set_markup(self._dot_markup(DOT_COLORS["idle"]))
+        top.pack_start(self.dot, False, False, 0)
 
-        self.status = ttk.Label(top, text="待机", font=(FONT, 11, "bold"))
-        self.status.pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="设置", width=6, command=self.app.open_settings).pack(side="right")
-        self.keys_label = ttk.Label(top, foreground="#888")
-        self.keys_label.pack(side="right", padx=(0, 8))
+        self.status = Gtk.Label(label="待机")
+        self.status.set_xalign(0)
+        top.pack_start(self.status, False, False, 0)
 
-        self.meter = ttk.Progressbar(self, maximum=100, length=100)
-        self.meter.pack(fill="x", **pad, pady=(0, 6))
+        settings_button = Gtk.Button(label="设置")
+        settings_button.connect("clicked", lambda *_: self.app.open_settings())
+        top.pack_end(settings_button, False, False, 0)
 
-        self.preview = tk.Text(
-            self, height=6, wrap="word", relief="flat", bg="#f4f5f7", fg="#202124",
-            font=(FONT, 10), state="disabled", cursor="arrow",
-        )
-        self.preview.pack(fill="both", expand=True, **pad)
-        self.preview.tag_configure("error", foreground=DOT_COLORS["error"])
+        self.keys_label = Gtk.Label()
+        self.keys_label.get_style_context().add_class("dim-label")
+        top.pack_end(self.keys_label, False, False, 0)
 
-        buttons = ttk.Frame(self)
-        buttons.pack(fill="x", **pad, pady=(8, 4))
-        self.toggle_button = ttk.Button(buttons, text="开始录音", command=self.app.toggle)
-        self.toggle_button.pack(side="left", fill="x", expand=True)
-        self.copy_button = ttk.Button(
-            buttons, text="复制", width=6, command=self.app.copy_result, state="disabled"
-        )
-        self.copy_button.pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="隐藏", width=6, command=self.hide).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="退出", width=6, command=self.app.quit).pack(side="left", padx=(6, 0))
+        self.meter = Gtk.ProgressBar()
+        box.pack_start(self.meter, False, False, 0)
 
-        self.message = ttk.Label(self, foreground="#5f6368", anchor="w", wraplength=380)
-        self.message.pack(fill="x", **pad, pady=(0, 10))
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.preview = Gtk.TextView()
+        self.preview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.preview.set_editable(False)
+        self.preview.set_cursor_visible(False)
+        scroller.add(self.preview)
+        box.pack_start(scroller, True, True, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.pack_start(buttons, False, False, 0)
+        self.toggle_button = Gtk.Button(label="开始录音")
+        self.toggle_button.connect("clicked", lambda *_: self.app.toggle())
+        buttons.pack_start(self.toggle_button, True, True, 0)
+        self.copy_button = Gtk.Button(label="复制")
+        self.copy_button.connect("clicked", lambda *_: self.app.copy_result())
+        self.copy_button.set_sensitive(False)
+        buttons.pack_start(self.copy_button, False, False, 0)
+        hide_button = Gtk.Button(label="隐藏")
+        hide_button.connect("clicked", lambda *_: self.hide())
+        buttons.pack_start(hide_button, False, False, 0)
+        quit_button = Gtk.Button(label="退出")
+        quit_button.connect("clicked", lambda *_: self.app.quit())
+        buttons.pack_start(quit_button, False, False, 0)
+
+        self.message = Gtk.Label()
+        self.message.set_xalign(0)
+        self.message.set_line_wrap(True)
+        self.message.get_style_context().add_class("dim-label")
+        box.pack_start(self.message, False, False, 0)
 
         self.apply_config()
-        self.geometry(self._geometry())
 
-    def _geometry(self) -> str:
-        width, height = 420, 280
-        saved = (self.app.cfg.get("window_pos") or "").strip()
-        if saved.startswith(("+", "-")):
-            return f"{width}x{height}{saved}"
-        screen_w = self.winfo_screenwidth()
-        return f"{width}x{height}+{max(0, screen_w - width - 60)}+120"
+    @staticmethod
+    def _dot_markup(color: str) -> str:
+        return f'<span foreground="{color}" size="large">●</span>'
 
     def apply_config(self) -> None:
-        self.attributes("-topmost", bool(self.app.cfg.get("always_on_top", True)))
+        self.set_keep_above(bool(self.app.cfg.get("always_on_top", True)))
         hold = keyhook.key_label(*keyhook.parse_spec(self.app.cfg.get("hold_key", "")))
         toggle = keyhook.key_label(*keyhook.parse_spec(self.app.cfg.get("toggle_key", "")))
-        self.keys_label.configure(text=f"长按 {hold}　·　切换 {toggle}")
+        self.keys_label.set_text(f"长按 {hold}　·　切换 {toggle}")
 
     def refresh(self, phase: str, session: engine.Session, message: str) -> None:
         if phase == "recording":
-            self.status.configure(text=f"录音中 {session.elapsed():.1f}s")
-            self.dot.itemconfigure(self._dot_item, fill=DOT_COLORS["recording"])
-            self.meter["value"] = min(100.0, session.level() * 100.0)
-            self.toggle_button.configure(text="停止", state="normal")
+            self.status.set_text(f"录音中 {session.elapsed():.1f}s")
+            self.dot.set_markup(self._dot_markup(DOT_COLORS["recording"]))
+            self.meter.set_fraction(min(1.0, session.level()))
+            self.toggle_button.set_label("停止")
+            self.toggle_button.set_sensitive(True)
         elif phase == "recognizing":
-            self.status.configure(text="识别中…")
-            self.dot.itemconfigure(self._dot_item, fill=DOT_COLORS["recognizing"])
-            self.meter["value"] = 0
-            self.toggle_button.configure(text="识别中…", state="disabled")
+            self.status.set_text("识别中…")
+            self.dot.set_markup(self._dot_markup(DOT_COLORS["recognizing"]))
+            self.meter.set_fraction(0.0)
+            self.toggle_button.set_label("识别中…")
+            self.toggle_button.set_sensitive(False)
         else:
             color = DOT_COLORS["error"] if self.app.state == "error" else DOT_COLORS["idle"]
-            self.status.configure(text="待机")
-            self.dot.itemconfigure(self._dot_item, fill=color)
-            self.meter["value"] = 0
-            self.toggle_button.configure(text="开始录音", state="normal")
+            self.status.set_text("待机")
+            self.dot.set_markup(self._dot_markup(color))
+            self.meter.set_fraction(0.0)
+            self.toggle_button.set_label("开始录音")
+            self.toggle_button.set_sensitive(True)
         if message:
-            self.message.configure(text=message)
-        self.copy_button.configure(state="normal" if self.app.result_text else "disabled")
+            self.message.set_text(message)
+        self.copy_button.set_sensitive(bool(self.app.result_text))
 
     def set_text(self, text: str, error: bool = False) -> None:
-        self.preview.configure(state="normal")
-        self.preview.delete("1.0", "end")
-        self.preview.insert("1.0", text)
-        self.preview.tag_add("error" if error else "ok", "1.0", "end")
-        self.preview.see("end")
-        self.preview.configure(state="disabled")
-
-    def position(self) -> str:
-        return f"+{self.winfo_x()}+{self.winfo_y()}"
+        self.preview.get_buffer().set_text(text)
+        self.message.get_style_context().remove_class("error")
+        if error:
+            self.message.get_style_context().add_class("error")
 
     def show(self) -> None:
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-
-    def hide(self) -> None:
-        self.withdraw()
+        self.show_all()
+        self.present()
 
     def toggle(self) -> None:
-        if self.winfo_viewable():
+        if self.get_visible():
             self.hide()
         else:
             self.show()
 
 
-# 设置面板见 settings.py（参数较多，单独成模块）
-
-
 def run(cfg: dict) -> None:
-    enable_dpi_awareness()
     try:
         app = App(cfg)
     except RuntimeError as exc:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("豆包语音输入", str(exc))
-        root.destroy()
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="豆包语音输入",
+        )
+        dialog.format_secondary_text(str(exc))
+        dialog.run()
+        dialog.destroy()
         return
     app.run()

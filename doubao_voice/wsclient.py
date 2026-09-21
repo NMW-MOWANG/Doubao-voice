@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import select
 import socket
 import ssl
 import struct
@@ -72,11 +73,21 @@ def _read_error_body(sock: socket.socket, headers: str, already: bytes) -> str:
     return body.decode("utf-8", "replace").strip()
 
 
+# 收发用两套时间：
+# * 发送/读到一半的容忍度要**足够长**——对端 RTT 200ms 时，一次 TCP 重传就要 0.6~1.4 秒，
+#   之前用 0.5 秒会把"网络重传"误判成"连接已死"，于是重连、几秒空白（实测就是这个现象）。
+# * 空闲检测用短的 select，保证读线程及时唤醒，但空闲本身不算异常。
+SEND_TIMEOUT = 5.0
+IDLE_POLL = 0.4
+
+
 class WebSocketClient:
     def __init__(self, url: str, headers: dict[str, str] | None = None, connect_timeout: float = 8.0):
         self.url = url
         self.headers = dict(headers or {})
         self.connect_timeout = connect_timeout
+        self.send_timeout = SEND_TIMEOUT
+        self.idle_poll = IDLE_POLL
         self._sock: socket.socket | None = None
         self._buf = bytearray()
         self._send_lock = None
@@ -134,7 +145,19 @@ class WebSocketClient:
         self._sock = sock
         self._buf = bytearray(rest)
         self._send_lock = threading.Lock()
-        sock.settimeout(0.5)
+        sock.settimeout(self.send_timeout)
+
+    def _has_data(self, timeout: float) -> bool:
+        """缓冲区里有数据，或者 socket 上可读（select 等待，不消耗数据）。"""
+        if self._buf:
+            return True
+        if self._sock is None:
+            return False
+        try:
+            readable, _, _ = select.select([self._sock], [], [], timeout)
+        except (OSError, ValueError):
+            return False
+        return bool(readable)
 
     def _read_exact(self, count: int) -> bytes:
         while len(self._buf) < count:
@@ -147,9 +170,22 @@ class WebSocketClient:
         return out
 
     def recv_frame(self) -> tuple[int, bytes]:
-        """读取一个完整消息，返回 (opcode, payload)。超时抛 socket.timeout。"""
+        """读取一个完整消息，返回 (opcode, payload)。
+
+        空闲（一直没数据）抛 socket.timeout，调用方当没事继续；
+        读到一半超时说明这条连接已经不可信，抛 WebSocketError 让调用方重连——
+        否则下次会把半个帧体当成帧头读，整个流就错位了。
+        """
+        if not self._has_data(self.idle_poll):
+            raise socket.timeout("空闲")
+        b0, b1 = self._read_exact(2)
+        try:
+            return self._recv_body(b0, b1)
+        except socket.timeout as exc:
+            raise WebSocketError("读到一半超时，连接状态不可信") from exc
+
+    def _recv_body(self, b0: int, b1: int) -> tuple[int, bytes]:
         while True:
-            b0, b1 = self._read_exact(2)
             opcode = b0 & 0x0F
             masked = bool(b1 & 0x80)
             length = b1 & 0x7F
@@ -167,23 +203,23 @@ class WebSocketClient:
 
             if opcode == OP_PING:
                 self._send_frame(OP_PONG, payload)
-                continue
-            if opcode == OP_PONG:
-                continue
-            if opcode == OP_CLOSE:
+            elif opcode == OP_PONG:
+                pass
+            elif opcode == OP_CLOSE:
                 return OP_CLOSE, payload
-            if opcode == OP_CONT:
+            elif opcode == OP_CONT:
                 self._fragments += payload
                 if b0 & 0x80:
                     data = self._fragments
                     self._fragments = bytearray()
                     return self._fragment_opcode, bytes(data)
-                continue
-            if not b0 & 0x80:
+            elif not b0 & 0x80:
                 self._fragments = bytearray(payload)
                 self._fragment_opcode = opcode
-                continue
-            return opcode, payload
+            else:
+                return opcode, payload
+
+            b0, b1 = self._read_exact(2)
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         header = bytearray([0x80 | opcode])
